@@ -1,134 +1,134 @@
-import os
-import sys
-import sqlite3
+import streamlit as st
+import psycopg2
+from psycopg2 import extras
 from rapidfuzz import process, utils
 
-# ==========================================
-# 🧠 PORTABLE ENGINE (DETERMINES RUN LOCATION)
-# ==========================================
-if getattr(sys, 'frozen', False):
-    # Running as a compiled EXE - look right next to Tally_Automation.exe
-    BASE_DIR = os.path.dirname(sys.executable)
-else:
-    # Running locally in VS Code
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-DB_PATH = os.path.join(BASE_DIR, "tally_data.db")
-
 def get_db_connection():
-    return sqlite3.connect(DB_PATH)
-
-def initialize_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS clients (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL
-        )
-    ''')
-    cursor.execute("PRAGMA table_info(clients)")
-    columns = [row[1] for row in cursor.fetchall()]
-    if 'name' not in columns:
-        cursor.execute("DROP TABLE IF EXISTS clients")
+    """Establishes a secure connection to the Supabase Cloud PostgreSQL database."""
+    # Reads the secure connection string directly from your Streamlit App Secrets vault
+    connection_string = st.secrets["db_url"]
+    conn = psycopg2.connect(connection_string)
+    
+    # Initialize the tables automatically if they do not exist on Supabase yet
+    with conn.cursor() as cursor:
+        # 1. Create clients table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS clients (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 name TEXT UNIQUE NOT NULL
-            )
+            );
         ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS mappings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            client_name TEXT NOT NULL,
-            type TEXT NOT NULL,         
-            raw_name TEXT NOT NULL,
-            tally_name TEXT NOT NULL,
-            UNIQUE(client_name, type, raw_name)
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-initialize_db()
-
-def add_new_client(client_name):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute("INSERT INTO clients (name) VALUES (?)", (client_name.strip(),))
+        
+        # 2. Create mappings table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS mappings (
+                id SERIAL PRIMARY KEY,
+                client_name TEXT NOT NULL,
+                type TEXT NOT NULL,
+                raw_name TEXT NOT NULL,
+                tally_name TEXT NOT NULL,
+                UNIQUE(client_name, type, raw_name)
+            );
+        ''')
         conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
-    finally:
-        conn.close()
+    return conn
 
 def get_all_clients():
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    """Fetches all registered client company profiles from the cloud database."""
     try:
-        cursor.execute("SELECT name FROM clients ORDER BY name ASC")
-        return [row[0] for row in cursor.fetchall()]
-    except sqlite3.OperationalError:
-        initialize_db()
-        return []
-    finally:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT name FROM clients ORDER BY name ASC;")
+            clients = [row[0] for row in cursor.fetchall() if row[0]]
         conn.close()
+        return clients
+    except Exception as e:
+        print(f"Cloud DB Error fetching clients: {e}")
+        return []
+
+def add_new_client(client_name):
+    """Registers a brand new company profile safely into the permanent cloud database."""
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO clients (name) VALUES (%s) ON CONFLICT (name) DO NOTHING;",
+                (client_name.strip(),)
+            )
+            conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"Cloud DB Error adding client: {e}")
+        return False
 
 def remove_client(client_name):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    """Deletes a client profile and clears out its associated mapping data globally."""
     try:
-        cursor.execute("DELETE FROM clients WHERE name = ?", (client_name,))
-        cursor.execute("DELETE FROM mappings WHERE client_name = ?", (client_name,))
-        conn.commit()
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM clients WHERE name = %s;", (client_name,))
+            cursor.execute("DELETE FROM mappings WHERE client_name = %s;", (client_name,))
+            conn.commit()
+        conn.close()
         return True
-    except Exception:
+    except Exception as e:
+        print(f"Cloud DB Error removing client: {e}")
         return False
+
+def save_mapping(client_name, mapping_type, raw_name, tally_name):
+    """Saves or overrides a mapping decision directly into the Supabase cloud ledger."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute('''
+                INSERT INTO mappings (client_name, type, raw_name, tally_name)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (client_name, type, raw_name) 
+                DO UPDATE SET tally_name = EXCLUDED.tally_name;
+            ''', (client_name, mapping_type, raw_name, tally_name))
+            conn.commit()
+    except Exception as e:
+        print(f"Cloud DB Sync Error: {e}")
     finally:
         conn.close()
 
-def save_mapping(client_name, mapping_type, raw_name, tally_name):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO mappings (client_name, type, raw_name, tally_name)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(client_name, type, raw_name) 
-        DO UPDATE SET tally_name = excluded.tally_name
-    ''', (client_name, mapping_type, raw_name.strip(), tally_name.strip()))
-    conn.commit()
-    conn.close()
+def smart_match(raw_value, tally_master_list, client_name, mapping_type):
+    """Checks cloud mapping history first, falling back to rapidfuzz string matching."""
+    if not raw_value or str(raw_value).strip() == "" or not tally_master_list:
+        return "", 0.0
 
-def smart_match(raw_name, tally_masters_list, client_name, mapping_type):
-    cleaned_raw = raw_name.strip()
-    if not tally_masters_list:
-        return cleaned_raw, 0.0
+    raw_str = str(raw_value).strip()
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT tally_name FROM mappings 
-        WHERE client_name = ? AND type = ? AND raw_name = ?
-    ''', (client_name, mapping_type, cleaned_raw))
-    row = cursor.fetchone()
-    conn.close()
+    # --- 1. CLOUD MEMORY HISTORY LOOKUP ---
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute('''
+                SELECT tally_name FROM mappings 
+                WHERE client_name = %s AND type = %s AND raw_name = %s
+                LIMIT 1;
+            ''', (client_name, mapping_type, raw_str))
+            result = cursor.fetchone()
+        conn.close()
+        
+        if result and result[0] and result[0] in tally_master_list:
+            return result[0], 100.0  # History match found
+    except Exception:
+        pass
 
-    if row:
-        historical_saved_name = row[0]
-        if historical_saved_name in tally_masters_list:
-            return historical_saved_name, 100.0
+    # --- 2. FUZZY MATCHING ENGINE FALLBACK ---
+    try:
+        extract = process.extractOne(
+            raw_str, 
+            tally_master_list, 
+            processor=utils.default_process,
+            score_cutoff=0.0
+        )
+        if extract:
+            best_match, score, _ = extract
+            return best_match, round(float(score), 1)
+    except Exception:
+        pass
 
-    extract = process.extractOne(
-        cleaned_raw, 
-        tally_masters_list, 
-        processor=utils.default_process,
-        score_cutoff=0.0
-    )
-    
-    if extract:
-        best_match_text, score, _ = extract
-        return best_match_text, round(float(score), 1)
-    
-    return tally_masters_list[0], 0.0
+    return tally_master_list[0] if tally_master_list else "", 0.0
